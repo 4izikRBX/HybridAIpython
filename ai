@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+import json
+import random
+import re
+import time
+import urllib.parse
+from typing import Callable, Optional
+
+import requests
+
+
+# =====================================================================
+#                       ПРОВАЙДЕРЫ НЕЙРОСЕТЕЙ
+# =====================================================================
+# Все провайдеры ниже работают без токенов.
+# Каждая функция должна вернуть строку-ответ или поднять исключение.
+
+TIMEOUT = 25  # секунд на запрос
+
+
+def provider_pollinations_text(prompt: str) -> str:
+    """Pollinations.ai — простой текстовый GET-эндпоинт, без ключа."""
+    url = "https://text.pollinations.ai/" + urllib.parse.quote(prompt)
+    r = requests.get(url, timeout=TIMEOUT)
+    r.raise_for_status()
+    text = r.text.strip()
+    if not text:
+        raise RuntimeError("Пустой ответ от Pollinations text")
+    return text
+
+
+def provider_pollinations_openai(prompt: str) -> str:
+    """Pollinations.ai — OpenAI-совместимый эндпоинт, тоже без ключа."""
+    url = "https://text.pollinations.ai/openai"
+    payload = {
+        "model": "openai",
+        "messages": [
+            {"role": "system", "content": "Ты дружелюбный помощник. Отвечай кратко и по делу."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    r = requests.post(url, json=payload, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def provider_pollinations_mistral(prompt: str) -> str:
+    """Тот же Pollinations, но с моделью mistral — отдельная попытка."""
+    url = "https://text.pollinations.ai/" + urllib.parse.quote(prompt) + "?model=mistral"
+    r = requests.get(url, timeout=TIMEOUT)
+    r.raise_for_status()
+    text = r.text.strip()
+    if not text:
+        raise RuntimeError("Пустой ответ от Pollinations mistral")
+    return text
+
+
+def provider_duckduckgo(prompt: str) -> str:
+    """DuckDuckGo Instant Answer — даёт справочные ответы, ключ не нужен."""
+    url = "https://api.duckduckgo.com/"
+    params = {"q": prompt, "format": "json", "no_html": 1, "skip_disambig": 1}
+    r = requests.get(url, params=params, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+
+    if data.get("AbstractText"):
+        return data["AbstractText"]
+    if data.get("Answer"):
+        return str(data["Answer"])
+    if data.get("Definition"):
+        return data["Definition"]
+    if data.get("RelatedTopics"):
+        for topic in data["RelatedTopics"]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                return topic["Text"]
+    raise RuntimeError("DuckDuckGo не нашёл ответа")
+
+
+# Список провайдеров в порядке приоритета.
+# Если один падает — пробуется следующий.
+PROVIDERS: list[tuple[str, Callable[[str], str]]] = [
+    ("Pollinations (OpenAI)", provider_pollinations_openai),
+    ("Pollinations (text)", provider_pollinations_text),
+    ("Pollinations (mistral)", provider_pollinations_mistral),
+    ("DuckDuckGo", provider_duckduckgo),
+]
+
+
+# =====================================================================
+#                ВСТРОЕННЫЙ ЧАТ-БОТ (FALLBACK)
+# =====================================================================
+# Срабатывает, если все нейросети недоступны.
+# Узнаёт фразы по ключевым словам и подбирает ответ из списка.
+
+FALLBACK_RULES: list[tuple[list[str], list[str]]] = [
+    (
+        ["привет", "здравствуй", "хай", "hello", "hi", "доброе утро", "добрый день", "добрый вечер"],
+        ["Привет!", "Здравствуй!", "Рад тебя видеть.", "Привет, чем могу помочь?"],
+    ),
+    (
+        ["как дела", "как ты", "как жизнь", "как сам", "how are you"],
+        ["Всё отлично, спасибо!", "Работаю в офлайн-режиме, но настроение хорошее.", "Бодр и готов общаться."],
+    ),
+    (
+        ["как тебя зовут", "твоё имя", "твое имя", "кто ты", "what is your name", "who are you"],
+        ["Я мульти-бот: использую несколько нейросетей сразу.", "Меня зовут MultiAI. Приятно познакомиться!"],
+    ),
+    (
+        ["что ты умеешь", "помоги", "функции", "возможности", "help"],
+        [
+            "Я подключаюсь к нескольким бесплатным нейросетям. "
+            "Если одна занята — пробую следующую. Если все недоступны — отвечаю сам.",
+        ],
+    ),
+    (
+        ["спасибо", "благодарю", "thanks", "thank you"],
+        ["Пожалуйста!", "Не за что.", "Всегда рад помочь."],
+    ),
+    (
+        ["пока", "до свидания", "увидимся", "bye", "goodbye"],
+        ["Пока!", "До встречи!", "Удачи!"],
+    ),
+    (
+        ["который час", "сколько времени", "время"],
+        [time.strftime("Сейчас %H:%M по локальному времени.")],
+    ),
+    (
+        ["какой день", "какое число", "сегодня", "дата"],
+        [time.strftime("Сегодня %d.%m.%Y.")],
+    ),
+    (
+        ["анекдот", "шутка", "пошути"],
+        [
+            "Программист в магазине: «Дайте мне 1 батон. Если будут яйца — возьмите 10».",
+            "— Сколько программистов нужно, чтобы вкрутить лампочку? — Ни одного, это аппаратная проблема.",
+            "Жена программисту: «Купи батон хлеба, если будут яйца — возьми десяток». Вернулся с 10 батонами.",
+        ],
+    ),
+    (
+        ["погода"],
+        ["Я в офлайне и не вижу погоду, но за окном наверняка интересно. Попробуй спросить позже."],
+    ),
+]
+
+DEFAULT_FALLBACK = [
+    "Все нейросети сейчас заняты. Попробуй переформулировать вопрос или повтори чуть позже.",
+    "Я тебя слышу, но облачные модели не отвечают. Скажи иначе — я постараюсь помочь сам.",
+    "Извини, не понял. Можешь задать вопрос проще?",
+]
+
+
+def chatbot_fallback(prompt: str) -> str:
+    """Простейший rule-based чат-бот на готовых ответах."""
+    text = prompt.lower().strip()
+    for keywords, answers in FALLBACK_RULES:
+        for kw in keywords:
+            if re.search(rf"\b{re.escape(kw)}\b", text):
+                return random.choice(answers)
+    return random.choice(DEFAULT_FALLBACK)
+
+
+# =====================================================================
+#                       ОСНОВНАЯ ЛОГИКА БОТА
+# =====================================================================
+
+class MultiAIBot:
+    """Бот, опрашивающий список провайдеров по очереди."""
+
+    def __init__(self, providers=PROVIDERS, retries: int = 1, verbose: bool = True):
+        self.providers = providers
+        self.retries = retries
+        self.verbose = verbose
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg)
+
+    def ask(self, prompt: str) -> str:
+        for name, func in self.providers:
+            for attempt in range(1, self.retries + 1):
+                try:
+                    self._log(f"  → пробую {name} (попытка {attempt})...")
+                    answer = func(prompt)
+                    if answer and answer.strip():
+                        self._log(f"  ✓ ответил {name}")
+                        return answer.strip()
+                except Exception as e:
+                    self._log(f"  ✗ {name} недоступен: {e}")
+                    continue
+
+        self._log("  ! все нейросети заняты — включаю встроенный чат-бот")
+        return chatbot_fallback(prompt)
+
+
+# =====================================================================
+#                       СОХРАНЕНИЕ В ФАЙЛ
+# =====================================================================
+
+LOG_FILE = "chat_log.txt"
+
+
+def save_to_file(prompt: str, answer: str, path: str = LOG_FILE) -> None:
+    """Дописывает диалог в текстовый файл."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]\n")
+        f.write(f"Вы: {prompt}\n")
+        f.write(f"Бот: {answer}\n")
+        f.write("-" * 60 + "\n")
+
+
+# =====================================================================
+#                            ИНТЕРФЕЙС
+# =====================================================================
+
+def main() -> None:
+    print("=" * 60)
+    print("  Мульти-нейросетевой бот")
+    print("  Подключено провайдеров:", len(PROVIDERS))
+    print("  Команды: /выход — закончить, /очистить — стереть лог")
+    print("=" * 60)
+
+    bot = MultiAIBot()
+
+    while True:
+        try:
+            prompt = input("\nВы: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nДо встречи!")
+            break
+
+        if not prompt:
+            continue
+        if prompt.lower() in {"/выход", "/exit", "/quit"}:
+            print("До встречи!")
+            break
+        if prompt.lower() in {"/очистить", "/clear"}:
+            open(LOG_FILE, "w", encoding="utf-8").close()
+            print("Лог очищен.")
+            continue
+
+        answer = bot.ask(prompt)
+        print(f"\nБот: {answer}")
+        save_to_file(prompt, answer)
+
+
+if __name__ == "__main__":
+    main()
